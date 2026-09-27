@@ -27,6 +27,12 @@
   DO UPDATE ... RETURNING`），并发提交同样唯一且连续；现场大屏/解说端
   可订阅实时推送，断线后凭 `Last-Event-ID` 精确续传，并提供按序号
   分页查询的历史事件接口。
+- **定向赛务公告与确认回执**：按「参赛者 / 当前排名区间 / 某版工位
+  方案的工位号」三类规则取并集、去重后再应用排除名单，发布时在**同一
+  写事务内确认事件序号快照未变化**并冻结收件人；规则无效或快照已
+  变化一律不落库。公告正文不可改写，只能发布新版本并重新冻结收件人，
+  **旧版回执不沿用**；仅该版冻结收件人可确认回执，重复提交返回原
+  回执，另提供已确认 / 未确认名单查询。
 
 配对在 Edmonds 带花树（Blossom）最小权完美匹配算法上实现
 （`networkx.min_weight_matching`，O(n³)），同代价方案用可加的
@@ -206,7 +212,8 @@ data: {"tournament_id": 1, "seq": 6, "type": "round.generated",
   `round.generated`、`result.submitted`、`round.closed`、
   `station_plan.published`、`round_clock.started`、
   `round_clock.paused`、`round_clock.resumed`、
-  `round_clock.extended`；
+  `round_clock.extended`、`announcement.published`、
+  `announcement.acknowledged`；
 - 事件与业务变更在**同一数据库事务**中写入：事务回滚则事件一并
   回滚，不会出现"有事件无变更"或"有变更无事件"；
 - **并发安全**：事件序号不再"查询最大 seq 后插入"，而是对
@@ -429,6 +436,140 @@ curl http://localhost:8000/tournaments/1/rounds/1/clock
    SSE 订阅者与事件分页接口立即可见；被拒绝的命令不产生事件、
    不落任何数据。
 
+### 11. 定向赛务公告与确认回执
+
+赛事进行中可发布**定向公告**（如检录、调台通知）。发布请求携带：
+
+- `request_id`：幂等键，重复提交（相同参数）原样返回首次结果；
+  同一 `request_id` 携带不同参数返回 `409`；
+- `expected_event_seq`：发布前断言的赛事当前最大事件序号，用于
+  **乐观快照**——不一致返回 `409` 且不落库（调用前可先经
+  `GET /tournaments/{id}/events` 读取最新序号）；
+- `body`：公告正文（该版本不可变）；
+- `rules`：收件规则。
+
+收件规则三类选择器取**并集、去重**，再应用排除名单：
+
+| 字段 | 含义 |
+| --- | --- |
+| `participant_ids` | 直接指定参赛者 id |
+| `rank_ranges` | 当前排名（与 `/standings` 同口径，实时计入进行中轮次）的闭区间 `{rank_from, rank_to}` |
+| `station_plans` | 某轮某版工位方案中，指定工位号上对局的**双方选手**：`{round_no, version, station_nos}` |
+| `exclude_participant_ids` | 排除名单（并集之后剔除） |
+
+三类选择器至少提供一项。所有引用必须有效且属于当前赛事：参赛者
+不存在/不属于本赛事、排名区间越界、轮次/工位方案版本不存在、
+工位号不在该版方案中，或并集再排除后没有任何收件人，均返回
+`409` 且不落库。
+
+```bash
+# 先读取当前事件序号
+SEQ=$(curl -s http://localhost:8000/tournaments/1/events | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['last_seq'])")
+
+# 并集：选手3 + 当前排名前2 + 第1轮第1版方案中工位1的双方，再排除选手1
+curl -X POST http://localhost:8000/tournaments/1/announcements \
+  -H "Content-Type: application/json" \
+  -d "{\"request_id\": \"ann-1\", \"expected_event_seq\": $SEQ,
+       \"body\": \"请相关选手 10 分钟后到检录处\",
+       \"rules\": {
+         \"participant_ids\": [3],
+         \"rank_ranges\": [{\"rank_from\": 1, \"rank_to\": 2}],
+         \"station_plans\": [{\"round_no\": 1, \"version\": 1,
+                             \"station_nos\": [1]}],
+         \"exclude_participant_ids\": [1]
+       }}"
+```
+
+```json
+{
+  "id": 1, "tournament_id": 1, "latest_version": 1,
+  "created_at": "2026-09-27T08:00:00.000000Z",
+  "latest_revision": {
+    "id": 1, "announcement_id": 1, "tournament_id": 1,
+    "version": 1, "body": "请相关选手 10 分钟后到检录处",
+    "rules": {
+      "participant_ids": [3],
+      "rank_ranges": [{"rank_from": 1, "rank_to": 2}],
+      "station_plans": [{"round_no": 1, "version": 1, "station_nos": [1]}],
+      "exclude_participant_ids": [1]
+    },
+    "expected_event_seq": 9,
+    "recipient_count": 3, "acknowledged_count": 0,
+    "created_at": "2026-09-27T08:00:00.000000Z"
+  }
+}
+```
+
+收件人在发布的**同一写事务**内解析并**冻结**：之后排名变化、赛果
+录入、工位方案新版本都不影响已发布版本的收件名单。发布成功写入
+`announcement.published` 事件（载荷含 `announcement_id`、
+`version`、冻结的 `participant_ids` 与 `expected_event_seq`）。
+
+**公告不可改写**：需要更改时发布新版本（`version` 递增），新版本
+重新按当时的规则与排名冻结收件人；旧版本与旧版回执原样保留，
+**旧版回执不会沿用到新版本**。
+
+```bash
+SEQ=$(curl -s http://localhost:8000/tournaments/1/events | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['last_seq'])")
+
+curl -X POST http://localhost:8000/announcements/1/revisions \
+  -H "Content-Type: application/json" \
+  -d "{\"request_id\": \"ann-1-rev1\", \"expected_event_seq\": $SEQ,
+       \"body\": \"地点改为 B 区检录处\",
+       \"rules\": {\"participant_ids\": [2, 3]}}"
+```
+
+**确认回执**：仅该版本冻结的收件人可确认；非收件人返回 `409`，
+参赛者不存在返回 `404`。首次确认返回 `201`；同一参赛者重复提交
+**原样返回首次回执**（HTTP `200`，确认时间不变，不重复产生事件）。
+
+```bash
+# 选手 2 确认（201，返回含确认时间的回执）
+curl -X POST \
+  http://localhost:8000/announcements/1/revisions/2/acknowledgements \
+  -H "Content-Type: application/json" \
+  -d '{"participant_id": 2}'
+
+# 重复提交：返回同一张回执
+curl -X POST \
+  http://localhost:8000/announcements/1/revisions/2/acknowledgements \
+  -H "Content-Type: application/json" \
+  -d '{"participant_id": 2}'
+
+# 已确认 / 未确认名单（按参赛者编号升序）
+curl http://localhost:8000/announcements/1/revisions/2/acknowledgements
+```
+
+```json
+{
+  "announcement_id": 1, "version": 2,
+  "acknowledged": [
+    {"participant_id": 2, "number": 2, "name": "Bob"}
+  ],
+  "pending": [
+    {"participant_id": 3, "number": 3, "name": "Cara"}
+  ]
+}
+```
+
+确认成功写入 `announcement.acknowledged` 事件（载荷含
+`announcement_id`、`version`、`participant_id`）。被拒绝的请求
+（规则无效、快照冲突、非收件人确认）不产生事件、不落任何数据。
+
+查询接口：
+
+```bash
+# 赛事下的公告（含最新版本摘要）
+curl http://localhost:8000/tournaments/1/announcements
+# 单个公告（含最新版本）
+curl http://localhost:8000/announcements/1
+# 全部版本 / 指定版本（含规则快照、冻结收件人数、已确认人数）
+curl http://localhost:8000/announcements/1/revisions
+curl http://localhost:8000/announcements/1/revisions/1
+```
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -452,6 +593,14 @@ curl http://localhost:8000/tournaments/1/rounds/1/clock
 | GET | `/tournaments/{id}/rounds/{round_no}/station-plans/{version}` | 指定版本的工位方案 |
 | POST | `/tournaments/{id}/rounds/{round_no}/clock/actions` | 执行计时命令（start/pause/resume/extend，幂等 + 乐观版本） |
 | GET | `/tournaments/{id}/rounds/{round_no}/clock` | 查询时钟版本、状态与各场截止时刻/剩余秒数 |
+| POST | `/tournaments/{id}/announcements` | 发布定向公告（收件规则并集/排除、序号快照、冻结收件人、幂等） |
+| GET | `/tournaments/{id}/announcements` | 赛事下公告列表（含最新版本摘要） |
+| GET | `/announcements/{id}` | 公告详情（含最新版本） |
+| POST | `/announcements/{id}/revisions` | 生成新版本并重新冻结收件人（幂等 + 序号快照） |
+| GET | `/announcements/{id}/revisions` | 公告全部版本 |
+| GET | `/announcements/{id}/revisions/{version}` | 指定版本详情（规则快照、收件/已确认人数） |
+| POST | `/announcements/{id}/revisions/{version}/acknowledgements` | 该版收件人确认回执（重复提交返回原回执） |
+| GET | `/announcements/{id}/revisions/{version}/acknowledgements` | 已确认 / 未确认名单 |
 | PUT | `/matches/{match_id}/result` | 录入/修改一场赛果 |
 | GET | `/tournaments/{id}/standings` | 排名（含 Buchholz 分） |
 | GET | `/tournaments/{id}/events/stream` | SSE 事件流（支持 `Last-Event-ID` 续传、心跳注释） |
@@ -511,7 +660,13 @@ pytest
 （状态机非法转换 409 不落库、版本冲突、request_id 幂等重放与
 冲突、暂停冻结/恢复延续、读取时推算无需写库、extend 目标校验、
 截止时刻拒绝赛果与加时重开窗口、封盘冻结与命令拒绝、事件同事务
-有序发布——时间断言经注入固定时钟完成，不依赖真实等待），以及
+有序发布——时间断言经注入固定时钟完成，不依赖真实等待），
+定向公告专项（三类收件规则并集去重与排除、按当前排名取人、
+工位号取对局双方、规则无效/跨赛事引用/快照冲突 409 不落库不占号、
+收件人冻结不受后续排名变化影响、request_id 幂等重放与冲突、
+版本修订重新冻结且旧版回执不沿用、仅收件人可确认且重复提交返回
+原回执、已确认/未确认名单、同快照并发发布仅一成一败、
+发布与确认写入事件流），以及
 事件流专项测试——事务回滚不留事件、
 提交失败不广播且不留事件、原子计数器回滚不占号、并发报名/赛果/
 开轮（多线程屏障同时放行）下编号与序号唯一连续、并发提交按序号

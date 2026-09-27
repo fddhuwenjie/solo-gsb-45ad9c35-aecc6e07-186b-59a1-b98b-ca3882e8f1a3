@@ -9,6 +9,7 @@ from sqlalchemy import (
     Integer,
     JSON,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -338,3 +339,177 @@ class Event(Base):
     )
 
     tournament: Mapped[Tournament] = relationship(back_populates="events")
+
+
+class Announcement(Base):
+    """定向赛务公告：版本化，公告本体不可改写。
+
+    发布即生成公告行与第 1 版 AnnouncementRevision（同时冻结收件人
+    快照）；需要更改时只能经 POST .../revisions 生成新版本并重新
+    冻结收件人，旧版本与旧版回执原样保留、不沿用到新版。
+    """
+
+    __tablename__ = "announcements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    tournament: Mapped[Tournament] = relationship()
+    revisions: Mapped[list["AnnouncementRevision"]] = relationship(
+        back_populates="announcement",
+        cascade="all, delete-orphan",
+        order_by="AnnouncementRevision.version",
+    )
+    actions: Mapped[list["AnnouncementAction"]] = relationship(
+        back_populates="announcement",
+        cascade="all, delete-orphan",
+        order_by="AnnouncementAction.id",
+    )
+
+
+class AnnouncementRevision(Base):
+    """公告的一个版本：正文、收件规则快照与冻结时点。
+
+    rules 保存规范化后的收件规则快照；收件人在发布/修订的同一写
+    事务内解析、去重并冻结到 announcement_recipients，之后排名、
+    工位方案等任何变化都不影响该版本。
+    """
+
+    __tablename__ = "announcement_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "announcement_id", "version", name="uq_announcement_version"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    announcement_id: Mapped[int] = mapped_column(
+        ForeignKey("announcements.id", ondelete="CASCADE"), nullable=False
+    )
+    # 公告内版本：从 1 开始递增
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 公告正文（该版本不可变）
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    # 收件规则快照：
+    # {participant_ids, rank_ranges: [{rank_from, rank_to}],
+    #  station_plans: [{round_no, version, station_nos}],
+    #  exclude_participant_ids}
+    rules: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 发布前断言的赛事事件序号（乐观快照，不一致不落库）
+    expected_event_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    announcement: Mapped[Announcement] = relationship(back_populates="revisions")
+    recipients: Mapped[list["AnnouncementRecipient"]] = relationship(
+        back_populates="revision",
+        cascade="all, delete-orphan",
+        order_by="AnnouncementRecipient.id",
+    )
+    acknowledgements: Mapped[list["AnnouncementAcknowledgement"]] = relationship(
+        back_populates="revision",
+        cascade="all, delete-orphan",
+        order_by="AnnouncementAcknowledgement.id",
+    )
+
+
+class AnnouncementRecipient(Base):
+    """某版公告冻结的一位收件人（去重后）。"""
+
+    __tablename__ = "announcement_recipients"
+    __table_args__ = (
+        UniqueConstraint(
+            "revision_id", "participant_id", name="uq_announcement_recipient"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision_id: Mapped[int] = mapped_column(
+        ForeignKey("announcement_revisions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+
+    revision: Mapped[AnnouncementRevision] = relationship(
+        back_populates="recipients"
+    )
+
+
+class AnnouncementAcknowledgement(Base):
+    """收件人对某版公告的确认回执：每版每人至多一行。
+
+    旧版本的回执挂在旧 revision 上，发布新版本后不会沿用。
+    """
+
+    __tablename__ = "announcement_acknowledgements"
+    __table_args__ = (
+        UniqueConstraint(
+            "revision_id", "participant_id", name="uq_announcement_ack"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision_id: Mapped[int] = mapped_column(
+        ForeignKey("announcement_revisions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    revision: Mapped[AnnouncementRevision] = relationship(
+        back_populates="acknowledgements"
+    )
+
+
+class AnnouncementAction(Base):
+    """公告发布/修订请求的幂等记录：同一 request_id 重放原样返回。
+
+    request_id 在赛事内唯一；记录与公告版本行、冻结收件人、
+    announcement.* 事件在同一事务中提交。规则无效/快照冲突等被
+    拒绝的请求（409）不落任何记录。
+    """
+
+    __tablename__ = "announcement_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "request_id", name="uq_announcement_action_request"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    announcement_id: Mapped[int] = mapped_column(
+        ForeignKey("announcements.id", ondelete="CASCADE"), nullable=False
+    )
+    revision_id: Mapped[int] = mapped_column(
+        ForeignKey("announcement_revisions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # 客户端幂等键：赛事内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # publish / revise
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 请求参数指纹：action/body/expected_event_seq/rules，
+    # revise 另含 announcement_id
+    params: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    announcement: Mapped[Announcement] = relationship(back_populates="actions")
