@@ -5,7 +5,7 @@ from fastapi import FastAPI
 
 from .database import init_db
 from .events.bus import event_bus
-from .routers import clock, events, rounds, stations, tournaments
+from .routers import announcements, clock, events, rounds, stations, tournaments
 
 
 @asynccontextmanager
@@ -30,8 +30,13 @@ app = FastAPI(
         "乐观版本控制落库，剩余时间由服务端 UTC 锚点与累计暂停时长推算，"
         "重启后读数连续；晚于该场截止时刻的赛果拒绝录入。"
         "另提供每赛事独立序号、可断线续传的 SSE 赛事事件流。"
+        "支持发布定向赛务公告：收件规则可并集指定参赛者、当前排名"
+        "区间与某版工位方案的工位号并应用排除名单，发布在同一写事务"
+        "内确认事件序号未变化并冻结去重后的收件人；公告版本化、不可"
+        "改写，修订生成新版本并重新冻结收件人，各版收件人独立确认"
+        "回执（重复提交幂等返回原结果）。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -46,3 +51,4 @@ app.include_router(rounds.router)
 app.include_router(stations.router)
 app.include_router(clock.router)
 app.include_router(events.router)
+app.include_router(announcements.router)

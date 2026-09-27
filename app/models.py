@@ -45,6 +45,11 @@ class Tournament(Base):
         cascade="all, delete-orphan",
         order_by="Event.seq",
     )
+    announcements: Mapped[list["Announcement"]] = relationship(
+        back_populates="tournament",
+        cascade="all, delete-orphan",
+        order_by="Announcement.id",
+    )
 
 
 class Participant(Base):
@@ -338,3 +343,129 @@ class Event(Base):
     )
 
     tournament: Mapped[Tournament] = relationship(back_populates="events")
+
+
+class Announcement(Base):
+    """定向赛务公告：版本化、发布后不可变。
+
+    每次发布（POST /tournaments/{id}/announcements）创建公告及
+    版本 1；修订（POST /announcements/{id}/revisions）只新增版本行，
+    历史版本与各版冻结收件人/回执永久保留。
+    """
+
+    __tablename__ = "announcements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    tournament: Mapped[Tournament] = relationship(back_populates="announcements")
+    versions: Mapped[list["AnnouncementVersion"]] = relationship(
+        back_populates="announcement",
+        cascade="all, delete-orphan",
+        order_by="AnnouncementVersion.version",
+    )
+
+
+class AnnouncementVersion(Base):
+    """公告的一个版本：正文与发布时冻结的收件规则快照。"""
+
+    __tablename__ = "announcement_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "announcement_id", "version", name="uq_announcement_version"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    announcement_id: Mapped[int] = mapped_column(
+        ForeignKey("announcements.id", ondelete="CASCADE"), nullable=False
+    )
+    # 公告内版本：首次发布为 1，每次修订 +1
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 公告正文（各版本独立保存，旧版本不可改写）
+    body: Mapped[str] = mapped_column(String, nullable=False)
+    # 收件规则快照（发布/修订时的规则原样冻结）：
+    # {participant_ids, rank_from, rank_to,
+    #  station_plan: {round_no, version, station_nos}, exclude_participant_ids}
+    rule: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    announcement: Mapped[Announcement] = relationship(back_populates="versions")
+    recipients: Mapped[list["AnnouncementRecipient"]] = relationship(
+        back_populates="version_obj",
+        cascade="all, delete-orphan",
+        order_by="AnnouncementRecipient.participant_id",
+    )
+
+
+class AnnouncementRecipient(Base):
+    """某版公告发布时冻结的收件人快照及该版回执。
+
+    行在发布/修订的写事务内按去重后的收件人写入；后续参赛者/
+    排名/工位方案变化不改变收件人。同一 (version_id, participant_id)
+    至多一行——该行即「是否为该版收件人」与「是否已确认」的唯一
+    事实来源：acked_at 非空表示已提交该版回执。
+    """
+
+    __tablename__ = "announcement_recipients"
+    __table_args__ = (
+        UniqueConstraint(
+            "version_id", "participant_id", name="uq_announcement_recipient"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version_id: Mapped[int] = mapped_column(
+        ForeignKey("announcement_versions.id", ondelete="CASCADE"), nullable=False
+    )
+    participant_id: Mapped[int] = mapped_column(
+        ForeignKey("participants.id", ondelete="CASCADE"), nullable=False
+    )
+    # 收件时参赛者信息快照：查询名单不依赖参赛者当前状态
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 该版回执提交时刻（UTC）；未确认为 NULL
+    acked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    version_obj: Mapped[AnnouncementVersion] = relationship(
+        back_populates="recipients"
+    )
+
+
+class AnnouncementAction(Base):
+    """公告发布/修订请求的幂等记录：同一 request_id 重放原样返回。
+
+    记录与公告/版本行、收件人快照、announcement.* 事件在同一事务
+    中提交；被拒绝的请求（规则无效/外赛事方案/快照已变化 409 等）
+    不落任何记录。request_id 的作用域为赛事。
+    """
+
+    __tablename__ = "announcement_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "request_id", name="uq_announcement_action_request"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    # 客户端幂等键：赛事内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # publish / revise
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 请求参数指纹：规则/正文/期望序号/目标公告不同即视为冲突
+    params: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )

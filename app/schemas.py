@@ -6,6 +6,7 @@ from pydantic import (
     BaseModel,
     Field,
     field_serializer,
+    field_validator,
     model_validator,
 )
 
@@ -216,6 +217,169 @@ class StationPlanResponse(BaseModel):
         if v.tzinfo is None:
             v = v.replace(tzinfo=timezone.utc)
         return v.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# ---------- Announcement ----------
+
+class AnnouncementStationPlanRule(BaseModel):
+    """按工位方案圈定收件人：指定某轮某版方案中占用指定工位号的
+    对局双方。"""
+
+    round_no: int = Field(ge=1, description="工位方案所属轮次号")
+    version: int = Field(ge=1, description="工位方案版本号")
+    station_nos: list[int] = Field(
+        min_length=1, description="工位号列表（占用这些工位的对局双方）"
+    )
+
+    @field_validator("station_nos")
+    @classmethod
+    def _normalize_station_nos(cls, v: list[int]) -> list[int]:
+        # 去重排序，保留集合语义（规则为并集）
+        return sorted(set(v))
+
+
+class AnnouncementRule(BaseModel):
+    """定向收件规则：三类圈定条件取并集，再应用排除名单。
+
+    三类条件（至少指定一类）：
+    - participant_ids：参赛者 id 列表；
+    - rank_from/rank_to：当前排名闭区间（按 /standings 口径）；
+    - station_plan：某轮某版工位方案中占用指定工位号的对局双方。
+    以上并集去重后，排除 exclude_participant_ids 中的参赛者。
+    """
+
+    participant_ids: list[int] = Field(
+        default_factory=list, description="直接指定的参赛者 id（并集）"
+    )
+    rank_from: int | None = Field(
+        default=None, ge=1, description="当前排名区间起点（含）"
+    )
+    rank_to: int | None = Field(
+        default=None, ge=1, description="当前排名区间终点（含）"
+    )
+    station_plan: AnnouncementStationPlanRule | None = Field(
+        default=None, description="按某版工位方案工位号圈定"
+    )
+    exclude_participant_ids: list[int] = Field(
+        default_factory=list, description="排除名单（并集后整体排除）"
+    )
+
+    @field_validator("participant_ids", "exclude_participant_ids")
+    @classmethod
+    def _normalize_ids(cls, v: list[int]) -> list[int]:
+        return sorted(set(v))
+
+    @model_validator(mode="after")
+    def _check_rule_nonempty_and_rank(self):
+        if not (
+            self.participant_ids
+            or self.rank_from is not None
+            or self.rank_to is not None
+            or self.station_plan is not None
+        ):
+            raise ValueError("收件规则为空：至少指定一类圈定条件")
+        # 排名区间两个边界要么都给，要么都不给；给则起点不大于终点
+        if (self.rank_from is None) != (self.rank_to is None):
+            raise ValueError("排名区间必须同时提供 rank_from 与 rank_to")
+        if (
+            self.rank_from is not None
+            and self.rank_to is not None
+            and self.rank_from > self.rank_to
+        ):
+            raise ValueError("排名区间起点不能大于终点")
+        return self
+
+
+class AnnouncementCreate(BaseModel):
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前事件序号；不一致（快照已变化）返回 409",
+    )
+    body: str = Field(min_length=1, description="公告正文")
+    rule: AnnouncementRule = Field(description="定向收件规则")
+
+
+class AnnouncementRevisionCreate(BaseModel):
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前事件序号；不一致（快照已变化）返回 409",
+    )
+    body: str = Field(min_length=1, description="新版本正文")
+    rule: AnnouncementRule = Field(description="新版本的定向收件规则（重新冻结）")
+
+
+class AnnouncementVersionResponse(BaseModel):
+    id: int
+    version: int
+    body: str
+    rule: dict
+    # 冻结收件人数
+    recipient_count: int
+    # 已回执人数
+    acknowledged_count: int
+    created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, v: datetime) -> str:
+        return _serialize_utc(v)
+
+
+class AnnouncementResponse(BaseModel):
+    id: int
+    tournament_id: int
+    created_at: datetime
+    # 最新版本号
+    latest_version: int
+    versions: list[AnnouncementVersionResponse]
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, v: datetime) -> str:
+        return _serialize_utc(v)
+
+
+class AcknowledgementRequest(BaseModel):
+    participant_id: int = Field(description="提交回执的参赛者 id（须为该版收件人）")
+
+
+class AcknowledgementRecipientResponse(BaseModel):
+    participant_id: int
+    number: int
+    name: str
+    # 回执提交时刻（UTC，Z 结尾）；未确认为 null
+    acked_at: datetime | None = None
+
+    @field_serializer("acked_at")
+    def serialize_acked_at(self, v: datetime | None) -> str | None:
+        return _serialize_utc(v)
+
+
+class AcknowledgementResponse(BaseModel):
+    announcement_id: int
+    version: int
+    participant_id: int
+    # 该参与者当前是否已确认本版（首次确认与重复提交均为 true；
+    # 重复提交原样返回首次的 acked_at，不重复写事件）
+    acknowledged: bool
+    acked_at: datetime | None = None
+
+    @field_serializer("acked_at")
+    def serialize_acked_at(self, v: datetime | None) -> str | None:
+        return _serialize_utc(v)
+
+
+class AcknowledgementListResponse(BaseModel):
+    announcement_id: int
+    version: int
+    recipient_count: int
+    acknowledged_count: int
+    acknowledged: list[AcknowledgementRecipientResponse]
+    unacknowledged: list[AcknowledgementRecipientResponse]
 
 
 # ---------- Round Clock ----------

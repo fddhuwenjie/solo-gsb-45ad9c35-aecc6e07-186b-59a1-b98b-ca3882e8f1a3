@@ -29,6 +29,9 @@ ROUND_CLOCK_STARTED = "round_clock.started"
 ROUND_CLOCK_PAUSED = "round_clock.paused"
 ROUND_CLOCK_RESUMED = "round_clock.resumed"
 ROUND_CLOCK_EXTENDED = "round_clock.extended"
+ANNOUNCEMENT_PUBLISHED = "announcement.published"
+ANNOUNCEMENT_REVISED = "announcement.revised"
+ANNOUNCEMENT_ACKNOWLEDGED = "announcement.acknowledged"
 
 
 def _allocate_next_seq(db: Session, tournament_id: int) -> int:
@@ -117,6 +120,26 @@ def commit_and_publish(db: Session, events: list[Event]) -> None:
     snapshots = [snapshot(e) for e in ordered]
     db.commit()
     event_bus.publish(snapshots)
+
+
+def current_event_seq(db: Session, tournament_id: int) -> int:
+    """读取赛事当前最新事件序号（计数器行为 0；无行时回查事件表）。
+
+    用于乐观快照校验（expected_event_seq）：调用方须在写事务内、
+    writer_lock 持锁时读取，随后分配的下一序号即为此值 +1。
+    """
+    counter = db.get(EventCounter, tournament_id)
+    if counter is not None:
+        return counter.last_seq
+    # 计数器行尚未建立（老赛事）：回查事件表当前最大序号
+    from sqlalchemy import func
+
+    return (
+        db.query(func.max(Event.seq))
+        .filter(Event.tournament_id == tournament_id)
+        .scalar()
+        or 0
+    )
 
 
 def fetch_events_after(
